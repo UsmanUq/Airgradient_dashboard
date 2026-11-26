@@ -21,17 +21,32 @@ AirGradient outdoor monitors, and compares them side by side.
 ## How the data flows
 
 ```
-monitors ──► AirGradient cloud ──► app.py (background threads) ──► SQLite file ──► website
+monitors ──► AirGradient cloud ──► collector.py ──► SQLite file ──► app.py (website)
 ```
 
-- Every `REFRESH_SECONDS` the app fetches the latest reading of every monitor.
-- On start-up it downloads each monitor's history from the AirGradient API
-  (10 days per request, newest first) and fills in anything missed while
-  the app was off. Progress is saved, so restarts continue where they
-  stopped.
-- Readings are stored in a local SQLite database (`data/airgradient.sqlite`,
-  table `measurements`, one row per monitor per reading). The website only
-  reads from this file.
+The project runs as **two separate processes**:
+
+- **`collector.py`** is the only part that talks to AirGradient. Every
+  `REFRESH_SECONDS` it fetches the latest reading of every monitor. On
+  start-up it downloads each monitor's history (10 days per request, newest
+  first) and fills in anything missed while it was off. Progress is saved,
+  so restarts continue where they stopped. Run exactly one collector per
+  database.
+- **`app.py`** is the website. It only reads the database, so it can be
+  restarted or redeployed without interrupting data collection. The header
+  shows "collector not running" if the collector has stopped.
+- **`core.py`** holds what both share: settings, the parameter list
+  (`METRICS`) and the database code.
+
+Readings are stored in a local SQLite database (`data/airgradient.sqlite`,
+table `measurements`, one row per monitor per reading).
+
+| File | What to edit there |
+|---|---|
+| `app.py` | page layout, cards, charts, callbacks |
+| `assets/style.css` | colours, spacing, card styling |
+| `core.py` | parameters shown (`METRICS`), database schema |
+| `collector.py` | how data is fetched from AirGradient |
 
 ## Setup
 
@@ -43,10 +58,12 @@ cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
 ```
 
 Edit `.env` and set your own `AIRGRADIENT_API_TOKEN` and `MONITOR_IDS`
-(the location IDs of your monitors). Then run:
+(the location IDs of your monitors). Then start both processes, each in
+its own terminal:
 
 ```bash
-python app.py
+python collector.py     # terminal 1: collects data, keep it running
+python app.py           # terminal 2: the website
 ```
 
 and open http://localhost:8050.
@@ -54,8 +71,9 @@ and open http://localhost:8050.
 ## How the API key is protected
 
 - **Server-side only.** The AirGradient token is read from the server's
-  environment (`AIRGRADIENT_API_TOKEN`) by `app.py`, and only Python code on
-  the server calls the AirGradient API. The browser never talks to
+  environment (`AIRGRADIENT_API_TOKEN`) by `collector.py` only; the website
+  process does not need it at all. Only Python code on the server calls the
+  AirGradient API. The browser never talks to
   AirGradient: it calls this app's own Dash callback endpoint
   (`/_dash-update-component`), which reads from the local database.
 - **Nothing secret is sent to the browser.** The page, its layout and all
@@ -79,19 +97,27 @@ Do not upload `.env`. Set the same variables in the host's
 environment-variable settings instead (e.g. Render → *Environment*,
 Railway → *Variables*, Azure App Service → *Configuration*):
 
-| Variable | Secret? |
-|---|---|
-| `AIRGRADIENT_API_TOKEN` | **yes** |
-| `MONITOR_IDS` | yes (keep private) |
-| `HISTORY_START`, `REFRESH_SECONDS`, `DISPLAY_UTC_OFFSET_HOURS`, `DISPLAY_TZ_LABEL`, `DATABASE_PATH` | no |
+| Variable | Needed by | Secret? |
+|---|---|---|
+| `AIRGRADIENT_API_TOKEN` | collector | **yes** |
+| `MONITOR_IDS` | both | yes (keep private) |
+| `DATABASE_PATH`, `REFRESH_SECONDS`, `HISTORY_START` | both | no |
+| `DISPLAY_UTC_OFFSET_HOURS`, `DISPLAY_TZ_LABEL` | website | no |
 
-Start command (Linux hosts):
+Run two services (e.g. two systemd units, or a web service plus a
+background worker on Render / Railway), both pointing at the same
+`DATABASE_PATH`:
 
 ```bash
-gunicorn app:server --workers 1 --threads 8 --bind 0.0.0.0:$PORT
+python collector.py                                              # exactly one
+gunicorn app:server --workers 2 --threads 4 --bind 0.0.0.0:$PORT   # the website
 ```
 
-- Use **one worker**: each worker starts its own background collector.
-- Point `DATABASE_PATH` at a **persistent disk** (for example
-  `/var/data/airgradient.sqlite`); many hosts wipe the normal file system on
-  every deploy, which would make the app re-download all history.
+- Run **exactly one collector**. The website no longer collects anything,
+  so it can use several gunicorn workers.
+- Both services must see the same database file, so on a managed host they
+  need a shared disk. Simplest: run both on the same server.
+- Point `DATABASE_PATH` at a **persistent local disk** (for example
+  `/var/data/airgradient.sqlite`), never a network share. Many hosts wipe
+  the normal file system on every deploy, which would make the collector
+  re-download all history.

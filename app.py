@@ -1,67 +1,32 @@
 """
-AirGradient outdoor air-quality dashboard.
+AirGradient outdoor air-quality dashboard: the website.
 
-Collects data from several AirGradient outdoor monitors into a local SQLite
-database (live readings every REFRESH_SECONDS, plus a one-off backfill of
-each monitor's full history), and serves a Dash website where people pick
-which monitors to view, any date range that has data, and compare the
-monitors in line and bar charts.
+Serves a Dash site where people pick which monitors to view, any date
+range that has data, and compare the monitors in line and bar charts.
+
+The site only reads the SQLite database. The data is collected by
+collector.py, a separate process that must be running alongside it.
 """
 
 import os
-import time
-import sqlite3
-import logging
-import threading
-from contextlib import closing
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-import requests
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import (
     Dash, html, dcc, Input, Output, State, ctx, dash_table, no_update
 )
-from dotenv import load_dotenv
+
+from core import (
+    MONITOR_IDS, REFRESH_SECONDS, HISTORY_START, METRICS, COLS,
+    init_database, query, utc_str, parse_utc, read_status,
+)
 
 
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-log = logging.getLogger("airgradient")
-# AirGradient only accepts the token as a ?token= URL parameter. Requests
-# go server-to-server over HTTPS; keep the HTTP library from ever logging
-# those URLs, even if someone turns on debug logging.
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-API_BASE = os.getenv(
-    "AIRGRADIENT_BASE_URL",
-    "https://api.airgradient.com/public/api/v1",
-).rstrip("/")
-API_TOKEN = os.getenv("AIRGRADIENT_API_TOKEN", "").strip()
-AUTH_MODE = os.getenv("AIRGRADIENT_AUTH_MODE", "query").lower()
-AUTH_HEADER = os.getenv("AIRGRADIENT_AUTH_HEADER", "X-API-Key")
-
-# The monitors shown on the site, in display order. Order fixes each
-# monitor's colour, so a monitor keeps its colour whatever is selected.
-# Set in .env (never in code), e.g. MONITOR_IDS=111111,222222
-MONITOR_IDS = [
-    int(x) for x in os.getenv("MONITOR_IDS", "").split(",") if x.strip()
-]
-if not MONITOR_IDS:
-    raise SystemExit(
-        "MONITOR_IDS is not set. Copy .env.example to .env and fill in "
-        "your AirGradient location IDs."
-    )
 
 # The browser only ever sees these neutral keys (m1, m2, ...), never the
 # real location IDs; the server translates them back.
@@ -75,12 +40,6 @@ def ids_from_keys(keys):
               if k in FROM_PUBLIC_KEY}
     return [m for m in MONITOR_IDS if m in chosen]
 
-REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "60"))
-
-# How far back the history backfill looks.
-HISTORY_START = datetime.fromisoformat(
-    os.getenv("HISTORY_START", "2024-01-01")
-).replace(tzinfo=timezone.utc)
 
 # Times are shown in local time. Pakistan has no daylight saving, so a
 # fixed offset is exact and needs no timezone database.
@@ -89,37 +48,19 @@ TZ_LABEL = os.getenv("DISPLAY_TZ_LABEL", "PKT")
 OFFSET = timedelta(hours=UTC_OFFSET_HOURS)
 SQL_OFFSET = f"{UTC_OFFSET_HOURS * 60:+.0f} minutes"
 
-DB_PATH = Path(os.getenv("DATABASE_PATH", "data/airgradient.sqlite"))
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
 STALE_MINUTES = 30          # a monitor silent this long is shown as offline
-BACKFILL_WINDOW_DAYS = 10   # the API's maximum range per history request
+
+# The collector is treated as stopped if it has not tried a poll for this
+# long (a poll can take a few minutes while the API is retried).
+COLLECTOR_STALE = timedelta(seconds=max(5 * REFRESH_SECONDS, 600))
 
 
 # ============================================================
 # 2. PARAMETERS
 # ============================================================
 
-# Column name -> how it is shown and which API fields feed it. The first
-# field that has a value wins, so AirGradient's corrected values are used
-# when present.
-METRICS = {
-    "pm25": dict(label="PM2.5", unit="µg/m³", dp=1, who=15,
-                 keys=["pm02_corrected", "pm02"]),
-    "pm10": dict(label="PM10", unit="µg/m³", dp=1, who=45,
-                 keys=["pm10_corrected", "pm10"]),
-    "co2": dict(label="CO₂", unit="ppm", dp=0,
-                keys=["rco2_corrected", "rco2"]),
-    "temp": dict(label="Temperature", unit="°C", dp=1,
-                 keys=["atmp_corrected", "atmp"]),
-    "rh": dict(label="Humidity", unit="%", dp=0,
-               keys=["rhum_corrected", "rhum"]),
-    "tvoc": dict(label="TVOC index", unit="index", dp=0,
-                 keys=["tvocIndex"]),
-    "nox": dict(label="NOx index", unit="index", dp=0,
-                keys=["noxIndex"]),
-}
-COLS = list(METRICS)
+# The parameters themselves (METRICS) are defined in core.py, because the
+# collector needs them too.
 
 # US EPA PM2.5 categories (2024 breakpoints, µg/m³).
 AQI_BANDS = [
@@ -155,284 +96,9 @@ SYMBOL = {m: SYMBOLS[i % len(SYMBOLS)] for i, m in enumerate(MONITOR_IDS)}
 DIVERGING = [[0, "#eb6834"], [0.5, "#e8e7e3"], [1, "#2a78d6"]]
 
 
-# ============================================================
-# 4. DATABASE
-# ============================================================
-
-def connect():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.execute("PRAGMA journal_mode=WAL")
-    return con
-
-
-def init_database():
-    metric_cols = ", ".join(f"{c} REAL" for c in COLS)
-    with closing(connect()) as con, con:
-        con.executescript(f"""
-            CREATE TABLE IF NOT EXISTS measurements (
-                location_id INTEGER NOT NULL,
-                ts TEXT NOT NULL,            -- UTC, 'YYYY-MM-DD HH:MM:SS'
-                {metric_cols},
-                PRIMARY KEY (location_id, ts)
-            ) WITHOUT ROWID;
-
-            CREATE TABLE IF NOT EXISTS monitors (
-                location_id INTEGER PRIMARY KEY,
-                name TEXT,
-                model TEXT,
-                last_seen TEXT
-            );
-
-            -- Progress of the history backfill for each monitor.
-            CREATE TABLE IF NOT EXISTS backfill (
-                location_id INTEGER PRIMARY KEY,
-                oldest_done TEXT NOT NULL,
-                complete INTEGER NOT NULL DEFAULT 0
-            );
-        """)
-
-
-def query(sql, params=()):
-    with closing(connect()) as con:
-        return pd.read_sql_query(sql, con, params=list(params))
-
-
-def utc_str(dt):
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def parse_utc(text):
-    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
-        tzinfo=timezone.utc
-    )
-
-
-def save_rows(rows):
-    if not rows:
-        return
-    placeholders = ",".join("?" * (2 + len(COLS)))
-    with closing(connect()) as con, con:
-        con.executemany(
-            f"INSERT OR REPLACE INTO measurements "
-            f"(location_id, ts, {', '.join(COLS)}) "
-            f"VALUES ({placeholders})",
-            rows,
-        )
-
 
 # ============================================================
-# 5. AIRGRADIENT API
-# ============================================================
-
-def api_get(path, **params):
-    """GET an API path, retrying on errors. Never puts the token in logs."""
-    if not API_TOKEN:
-        raise RuntimeError("AIRGRADIENT_API_TOKEN is missing from .env")
-
-    headers = {"Accept": "application/json"}
-    if AUTH_MODE == "header":
-        headers[AUTH_HEADER] = API_TOKEN
-    else:
-        params["token"] = API_TOKEN
-
-    problem = "unknown error"
-    for attempt in range(4):
-        try:
-            response = requests.get(
-                f"{API_BASE}{path}", params=params,
-                headers=headers, timeout=60,
-            )
-            if response.status_code == 429:
-                problem = "rate limited (429)"
-                time.sleep(30 * (attempt + 1))
-                continue
-            if response.status_code >= 400:
-                problem = f"HTTP {response.status_code}"
-                if response.status_code < 500:
-                    break           # a client error will not fix itself
-                time.sleep(5 * (attempt + 1))
-                continue
-            return response.json()
-        except requests.RequestException as error:
-            problem = type(error).__name__
-            time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"AirGradient API request failed: {problem}")
-
-
-def api_time(dt):
-    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def first_number(measure, keys):
-    for key in keys:
-        value = measure.get(key)
-        if value is None:
-            continue
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def to_row(location_id, measure):
-    stamp = measure.get("timestamp")
-    if not stamp:
-        return None
-    try:
-        ts = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (
-        int(location_id),
-        utc_str(ts),
-        *[first_number(measure, METRICS[c]["keys"]) for c in COLS],
-    )
-
-
-def fetch_past(location_id, start, end):
-    data = api_get(
-        f"/locations/{location_id}/measures/past",
-        **{"from": api_time(start), "to": api_time(end)},
-    )
-    if not isinstance(data, list):
-        return []
-    return [r for r in (to_row(location_id, m) for m in data) if r]
-
-
-# ============================================================
-# 6. BACKGROUND COLLECTION
-# ============================================================
-
-STATUS = {"last_poll": None, "last_error": None}
-
-
-def poll_current():
-    """Store the latest reading of every monitor (one API request)."""
-    data = api_get("/locations/measures/current")
-    rows, monitors = [], []
-    for measure in data if isinstance(data, list) else []:
-        location_id = measure.get("locationId")
-        if location_id not in MONITOR_IDS:
-            continue
-        row = to_row(location_id, measure)
-        if row:
-            rows.append(row)
-        monitors.append((
-            int(location_id),
-            measure.get("locationName") or f"Monitor {location_id}",
-            measure.get("model"),
-            row[1] if row else None,
-        ))
-    save_rows(rows)
-    with closing(connect()) as con, con:
-        con.executemany("""
-            INSERT INTO monitors (location_id, name, model, last_seen)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(location_id) DO UPDATE SET
-                name = excluded.name,
-                model = excluded.model,
-                last_seen = COALESCE(excluded.last_seen, monitors.last_seen)
-        """, monitors)
-
-
-def live_worker():
-    while True:
-        try:
-            poll_current()
-            STATUS["last_poll"] = datetime.now(timezone.utc)
-            STATUS["last_error"] = None
-        except Exception as error:     # keep collecting whatever happens
-            STATUS["last_error"] = str(error)
-            log.warning("Live poll failed: %s", error)
-        time.sleep(REFRESH_SECONDS)
-
-
-def fill_gap_since_last_run():
-    """Fetch readings missed while the app was not running."""
-    now = datetime.now(timezone.utc)
-    started = query("SELECT location_id FROM backfill")
-    for location_id in started["location_id"]:
-        latest = query(
-            "SELECT MAX(ts) AS ts FROM measurements WHERE location_id = ?",
-            [int(location_id)],
-        )["ts"].iloc[0]
-        if not latest:
-            continue
-        cursor = parse_utc(latest)
-        while cursor < now - timedelta(minutes=5):
-            window_end = min(cursor + timedelta(days=BACKFILL_WINDOW_DAYS), now)
-            save_rows(fetch_past(int(location_id), cursor, window_end))
-            cursor = window_end
-            time.sleep(0.3)
-
-
-def backfill_worker():
-    """Walk back through each monitor's history, 10 days per request.
-
-    Monitors take turns, so all of them get their recent history first.
-    Progress is saved, so a restart continues where it stopped.
-    """
-    try:
-        fill_gap_since_last_run()
-    except Exception as error:
-        log.warning("Gap fill failed: %s", error)
-
-    now_text = utc_str(datetime.now(timezone.utc))
-    with closing(connect()) as con, con:
-        con.executemany(
-            "INSERT OR IGNORE INTO backfill (location_id, oldest_done) "
-            "VALUES (?, ?)",
-            [(m, now_text) for m in MONITOR_IDS],
-        )
-
-    while True:
-        pending = query(
-            f"SELECT location_id, oldest_done FROM backfill "
-            f"WHERE complete = 0 AND location_id IN "
-            f"({','.join('?' * len(MONITOR_IDS))})",
-            MONITOR_IDS,
-        )
-        if pending.empty:
-            log.info("History backfill complete.")
-            return
-
-        for location_id, oldest in pending.itertuples(index=False):
-            end = parse_utc(oldest)
-            start = max(end - timedelta(days=BACKFILL_WINDOW_DAYS),
-                        HISTORY_START)
-            try:
-                save_rows(fetch_past(int(location_id), start, end))
-            except Exception as error:
-                log.warning("Backfill %s failed: %s", location_id, error)
-                time.sleep(60)
-                continue
-            with closing(connect()) as con, con:
-                con.execute(
-                    "UPDATE backfill SET oldest_done = ?, complete = ? "
-                    "WHERE location_id = ?",
-                    (utc_str(start), int(start <= HISTORY_START),
-                     int(location_id)),
-                )
-            time.sleep(0.3)
-
-
-_workers_started = False
-
-
-def start_workers():
-    global _workers_started
-    if _workers_started:
-        return
-    _workers_started = True
-    threading.Thread(target=live_worker, daemon=True,
-                     name="live").start()
-    threading.Thread(target=backfill_worker, daemon=True,
-                     name="backfill").start()
-
-
-# ============================================================
-# 7. READING DATA FOR THE SITE
+# 4. READING DATA FOR THE SITE
 # ============================================================
 
 def monitor_names():
@@ -457,14 +123,16 @@ def coverage():
 
 
 def backfill_progress():
-    df = query("SELECT oldest_done, complete FROM backfill")
+    df = query("SELECT location_id, oldest_done, complete FROM backfill")
+    # Ignore monitors that were removed from MONITOR_IDS.
+    df = df[df["location_id"].isin(MONITOR_IDS)]
     if df.empty:
         return 0.0
     now = datetime.now(timezone.utc)
     total = (now - HISTORY_START).total_seconds()
     done = [
         1.0 if c else (now - parse_utc(o)).total_seconds() / total
-        for o, c in df.itertuples(index=False)
+        for _, o, c in df.itertuples(index=False)
     ]
     return min(1.0, sum(done) / len(MONITOR_IDS))
 
@@ -543,7 +211,7 @@ def load_latest(monitors):
 
 
 # ============================================================
-# 8. TIME RANGE AND RESOLUTION
+# 5. TIME RANGE AND RESOLUTION
 # ============================================================
 
 QUICK_RANGES = {
@@ -621,7 +289,7 @@ def with_gaps(part, threshold):
 
 
 # ============================================================
-# 9. CHARTS
+# 6. CHARTS
 # ============================================================
 
 def style(fig, height=360, ytitle=None, legend=True, hover="x unified"):
@@ -807,7 +475,7 @@ def fig_correlation(df, col, monitors, names):
 
 
 # ============================================================
-# 10. PAGE PIECES
+# 7. PAGE PIECES
 # ============================================================
 
 def aqi_band(pm25):
@@ -950,7 +618,7 @@ def legend_row(monitors, names):
 
 
 # ============================================================
-# 11. LAYOUT
+# 8. LAYOUT
 # ============================================================
 
 init_database()
@@ -1067,7 +735,7 @@ app.layout = serve_layout
 
 
 # ============================================================
-# 12. CALLBACKS
+# 9. CALLBACKS
 # ============================================================
 
 @app.callback(
@@ -1103,12 +771,17 @@ def update_status(_):
     options = monitor_options(names)
     cov = coverage()
     progress = backfill_progress()
+    status = read_status()
     parts = []
-    if STATUS["last_error"]:
+    if status is None or \
+            datetime.now(timezone.utc) - status["heartbeat"] > COLLECTOR_STALE:
+        parts.append(html.Span("Live updates stopped: collector not "
+                               "running", className="pill offline"))
+    elif status["last_error"]:
         parts.append(html.Span("Live updates paused: cannot reach "
                                "AirGradient", className="pill offline"))
-    elif STATUS["last_poll"]:
-        stamp = (STATUS["last_poll"] + OFFSET).strftime("%H:%M")
+    elif status["last_poll"]:
+        stamp = (status["last_poll"] + OFFSET).strftime("%H:%M")
         parts.append(html.Span(f"Live · updated {stamp} {TZ_LABEL}",
                                className="pill live"))
     if progress < 1:
@@ -1332,11 +1005,10 @@ def download(_csv, _xlsx, monitors, quick, start_date, end_date, res_choice):
 
 
 # ============================================================
-# 13. START
+# 10. START
 # ============================================================
 
-start_workers()
-
+# Data collection is not started here: run collector.py alongside.
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.getenv("PORT", "8050")),
             debug=False)
